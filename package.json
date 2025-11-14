@@ -59,6 +59,11 @@
           "type": "string",
           "default": "",
           "description": "Internal: Stores pending prompt to execute after workspace reload"
+        },
+        "copilotContextExecutor.jiraConfig": {
+          "type": "object",
+          "default": null,
+          "description": "Jira configuration (type, url, credentials)"
         }
       }
     }
