@@ -3,11 +3,24 @@
   "displayName": "Copilot Context Executor",
   "description": "Execute GitHub Copilot prompts with full workspace context",
   "version": "0.0.1",
+  "publisher": "RamNull",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RamNull/congenial-pancake"
+  },
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
     "Other"
+  ],
+  "keywords": [
+    "copilot",
+    "ai",
+    "context",
+    "workspace",
+    "automation"
   ],
   "activationEvents": [
     "onCommand:copilot-context-executor.executePrompt"
