@@ -60,6 +60,11 @@
           "default": "",
           "description": "Internal: Stores pending prompt to execute after workspace reload"
         },
+        "copilotContextExecutor.pendingAttachments": {
+          "type": "array",
+          "default": [],
+          "description": "Internal: Stores pending attachment file paths to open after workspace reload"
+        },
         "copilotContextExecutor.jiraConfig": {
           "type": "object",
           "default": null,

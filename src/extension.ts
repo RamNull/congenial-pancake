@@ -83,6 +83,10 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
                     await this._startWorkOnIssue(data.directory, data.issueKey);
                     break;
                 }
+                case 'createUnitTests': {
+                    await this._createUnitTests(data.directory, data.issueKey);
+                    break;
+                }
             }
         });
     }
@@ -431,6 +435,99 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
         }));
     }
 
+    private async _createUnitTests(directory: string, issueKey: string): Promise<void> {
+        try {
+            const config = vscode.workspace.getConfiguration().get<JiraConfig>('copilotContextExecutor.jiraConfig');
+            if (!config) {
+                vscode.window.showWarningMessage('Jira not configured');
+                return;
+            }
+
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: `Creating unit tests for ${issueKey}...`,
+                cancellable: false
+            }, async (progress) => {
+                progress.report({ message: 'Getting changeset...' });
+                const changeset = await this._getGitChangeset(directory);
+                
+                if (!changeset || changeset.trim().length === 0) {
+                    vscode.window.showWarningMessage('No changes detected. Please make code changes first.');
+                    return;
+                }
+                
+                progress.report({ message: 'Preparing unit test prompt...' });
+                const unitTestPrompt = this._buildUnitTestPrompt(issueKey, changeset);
+                
+                progress.report({ message: 'Opening Copilot Chat...' });
+                await this._sendToCopilotWithAttachments(unitTestPrompt, []);
+            });
+        } catch (error) {
+            vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    private async _getGitChangeset(directory: string): Promise<string> {
+        try {
+            const { execSync } = await import('node:child_process');
+            
+            // Get the diff of uncommitted changes
+            const diff = execSync('git diff HEAD', { cwd: directory, encoding: 'utf-8' });
+            
+            if (!diff || diff.trim().length === 0) {
+                // No uncommitted changes, try to get last commit diff
+                const lastCommitDiff = execSync('git diff HEAD~1 HEAD', { cwd: directory, encoding: 'utf-8' });
+                return lastCommitDiff;
+            }
+            
+            return diff;
+        } catch (error) {
+            console.error('Error getting git changeset:', error);
+            return '';
+        }
+    }
+
+    private _buildUnitTestPrompt(issueKey: string, changeset: string): string {
+        return `# Unit Test Generation for ${issueKey}
+
+## Instructions
+You are reviewing the code changes for Jira issue ${issueKey}. The developer has completed their implementation and validated the code.
+
+**Your task**: Generate comprehensive unit tests ONLY for the changed code in this changeset.
+
+## Requirements
+1. Analyze the git diff below to identify:
+   - New functions/methods that need testing
+   - Modified functions/methods that need updated tests
+   - Edge cases and error conditions
+
+2. Create unit tests that:
+   - Test all new functionality
+   - Cover happy path and edge cases
+   - Test error handling
+   - Follow the project's existing test patterns
+   - Have clear, descriptive test names
+
+3. For each test file:
+   - Place tests in the appropriate test directory
+   - Use the same naming convention as existing tests
+   - Include necessary imports and setup
+
+## Changeset (Git Diff)
+
+\`\`\`diff
+${changeset}
+\`\`\`
+
+## Action Items
+1. Review the changes above
+2. Generate unit test files for the modified code
+3. Run the tests and fix any failures
+4. Ensure all tests pass before marking complete
+
+Please generate the unit tests now.`;
+    }
+
     private async _startWorkOnIssue(directory: string, issueKey: string): Promise<void> {
         try {
             const config = vscode.workspace.getConfiguration().get<JiraConfig>('copilotContextExecutor.jiraConfig');
@@ -451,11 +548,135 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
                 progress.report({ message: 'Loading issue details...' });
                 const result = await this._fetchFullIssueDetailsWithAttachments(config, issueKey);
                 
+                // Add instruction about unit tests
+                const contextWithInstructions = result.context + 
+                    `\n\n---\n**IMPORTANT INSTRUCTIONS:**\n` +
+                    `1. Implement the required changes for this issue\n` +
+                    `2. Validate your implementation thoroughly\n` +
+                    `3. **DO NOT create unit tests yet** - unit tests will be created in a separate step after you validate the code\n` +
+                    `4. Once you've validated the code changes, click the "Create Unit Tests" button to generate tests for your changeset\n` +
+                    `5. The unit test generation will analyze only the files you've changed\n`;
+                
+                progress.report({ message: 'Setting up Git repository...' });
+                const issueType = await this._getIssueType(config, issueKey);
+                await this._setupGitBranch(directory, issueKey, issueType, progress);
+                
                 progress.report({ message: 'Opening workspace...' });
-                await this._executeWithContextAndFiles(directory, result.context, result.attachmentFiles);
+                await this._executeWithContextAndFiles(directory, contextWithInstructions, result.attachmentFiles, issueKey, issueType);
             });
         } catch (error) {
             vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    private async _getIssueType(config: JiraConfig, issueKey: string): Promise<string> {
+        try {
+            const authHeader = config.type === 'cloud'
+                ? 'Basic ' + Buffer.from(`${config.email}:${config.apiToken}`).toString('base64')
+                : 'Basic ' + Buffer.from(`${config.username}:${config.password}`).toString('base64');
+
+            const baseUrl = config.url.endsWith('/') ? config.url.slice(0, -1) : config.url;
+            const apiPath = config.type === 'cloud' ? '/rest/api/3/issue/' : '/rest/api/2/issue/';
+            const url = `${baseUrl}${apiPath}${issueKey}?fields=issuetype,labels`;
+
+            const response = await fetch(url, {
+                method: 'GET',
+                headers: {
+                    'Authorization': authHeader,
+                    'Accept': 'application/json'
+                }
+            });
+
+            if (response.ok) {
+                const issue = await response.json() as any;
+                const issueTypeName = issue.fields.issuetype.name.toLowerCase();
+                const labels = (issue.fields.labels || []).map((l: string) => l.toLowerCase());
+                
+                // Check labels first for bug indicator
+                if (labels.some((l: string) => l.includes('bug') || l.includes('defect') || l.includes('fix'))) {
+                    return 'bug';
+                }
+                
+                // Check issue type
+                if (issueTypeName.includes('bug') || issueTypeName.includes('defect')) {
+                    return 'bug';
+                }
+                
+                return 'feature';
+            }
+        } catch (error) {
+            console.log('Could not determine issue type, defaulting to feature:', error);
+        }
+        
+        return 'feature';
+    }
+
+    private async _setupGitBranch(directory: string, issueKey: string, issueType: string, progress: vscode.Progress<{ message?: string }>): Promise<void> {
+        try {
+            const { execSync } = await import('node:child_process');
+            
+            // Check if directory is a git repository
+            try {
+                execSync('git rev-parse --git-dir', { cwd: directory, stdio: 'pipe' });
+            } catch {
+                // Not a git repo, initialize it
+                progress.report({ message: 'Initializing Git repository...' });
+                execSync('git init', { cwd: directory });
+                execSync('git add .', { cwd: directory });
+                execSync('git commit -m "Initial commit"', { cwd: directory });
+                execSync('git branch -M main', { cwd: directory });
+                vscode.window.showInformationMessage('Git repository initialized with main branch');
+            }
+            
+            // Get current branch
+            const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: directory }).toString().trim();
+            
+            // Ensure we have a main branch
+            progress.report({ message: 'Checking main branch...' });
+            const branches = execSync('git branch', { cwd: directory }).toString();
+            
+            if (!branches.includes('main')) {
+                // Create main branch from current branch
+                execSync('git branch main', { cwd: directory });
+            }
+            
+            // Switch to main and pull latest (if remote exists)
+            if (currentBranch !== 'main') {
+                progress.report({ message: 'Switching to main branch...' });
+                execSync('git checkout main', { cwd: directory });
+            }
+            
+            // Try to pull latest from remote
+            try {
+                progress.report({ message: 'Pulling latest from remote...' });
+                execSync('git pull origin main', { cwd: directory, stdio: 'pipe' });
+            } catch {
+                console.log('No remote or pull failed, continuing with local main');
+            }
+            
+            // Create new branch based on issue type
+            const branchPrefix = issueType === 'bug' ? 'bug' : 'feature';
+            const branchName = `${branchPrefix}/${issueKey.toLowerCase()}`;
+            
+            progress.report({ message: `Creating branch ${branchName}...` });
+            
+            // Check if branch already exists
+            try {
+                execSync(`git checkout ${branchName}`, { cwd: directory, stdio: 'pipe' });
+                vscode.window.showInformationMessage(`Switched to existing branch: ${branchName}`);
+            } catch {
+                // Branch doesn't exist, create it
+                execSync(`git checkout -b ${branchName}`, { cwd: directory });
+                vscode.window.showInformationMessage(`Created and switched to new branch: ${branchName}`);
+            }
+            
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            console.error('Git setup error:', errorMsg);
+            vscode.window.showWarningMessage(
+                `Git setup failed: ${errorMsg}. Continuing without Git setup.`
+            );
+            // Don't throw - allow workflow to continue
         }
     }
 
@@ -1015,7 +1236,7 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async _executeWithContextAndFiles(directory: string, payload: string, attachmentFiles: string[]): Promise<void> {
+    private async _executeWithContextAndFiles(directory: string, payload: string, attachmentFiles: string[], issueKey?: string, issueType?: string): Promise<void> {
         try {
             const folderUri = vscode.Uri.file(directory);
             const currentWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -1309,8 +1530,26 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
             color: var(--vscode-button-foreground);
             font-weight: 500;
         }
-        .btn-start:hover {
+        .btn-start:hover:not(:disabled) {
             background-color: var(--vscode-button-hoverBackground);
+        }
+        .btn-start:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            background-color: var(--vscode-button-secondaryBackground);
+        }
+        .btn-test {
+            flex: 1;
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            font-weight: 500;
+        }
+        .btn-test:hover:not(:disabled) {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .btn-test:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
         }
         .empty-state {
             text-align: center;
@@ -1401,9 +1640,25 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
             
-            updateStatus('Loading issue ' + issueKey + '...');
+            updateStatus('Starting work on ' + issueKey + '...');
             vscode.postMessage({ 
                 type: 'startWork',
+                directory: directory,
+                issueKey: issueKey
+            });
+        }
+        
+        function createUnitTests(issueKey) {
+            const directory = document.getElementById('codeDirectory').value;
+            
+            if (!directory || directory === 'No directory selected') {
+                updateStatus('⚠️ Please select a workspace directory first');
+                return;
+            }
+            
+            updateStatus('Creating unit tests for ' + issueKey + '...');
+            vscode.postMessage({ 
+                type: 'createUnitTests',
                 directory: directory,
                 issueKey: issueKey
             });
@@ -1460,6 +1715,8 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
                         
                         const statusClass = getStatusClass(issue.status);
                         const priorityClass = getPriorityClass(issue.priority);
+                        const isInProgress = issue.status.toLowerCase().includes('in progress') || 
+                                            issue.status.toLowerCase().includes('active');
                         
                         issueCard.innerHTML = \`
                             <div class="issue-header">
@@ -1479,7 +1736,8 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
                                 </div>
                             </div>
                             <div class="issue-actions">
-                                <button class="btn btn-start" onclick="startWork('\${issue.key}')">▶ Start</button>
+                                <button class="btn btn-start" onclick="startWork('\${issue.key}')" \${isInProgress ? 'disabled' : ''}>▶ Start</button>
+                                <button class="btn btn-test" onclick="createUnitTests('\${issue.key}')" \${!isInProgress ? 'disabled' : ''}>🧪 Create Unit Tests</button>
                             </div>
                         \`;
                         
