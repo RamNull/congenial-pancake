@@ -87,6 +87,10 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
                     await this._createUnitTests(data.directory, data.issueKey);
                     break;
                 }
+                case 'markResolved': {
+                    await this._markResolved(data.directory, data.issueKey);
+                    break;
+                }
             }
         });
     }
@@ -433,6 +437,184 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
             status: issue.fields.status.name,
             priority: issue.fields.priority?.name || 'None'
         }));
+    }
+
+    private async _markResolved(directory: string, issueKey: string): Promise<void> {
+        try {
+            const config = vscode.workspace.getConfiguration().get<JiraConfig>('copilotContextExecutor.jiraConfig');
+            if (!config) {
+                vscode.window.showWarningMessage('Jira not configured');
+                return;
+            }
+
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: `Resolving ${issueKey}...`,
+                cancellable: false
+            }, async (progress) => {
+                const { execSync } = await import('node:child_process');
+                
+                // Get issue details for PR
+                progress.report({ message: 'Fetching issue details...' });
+                const issueDetails = await this._getIssueDetails(config, issueKey);
+                
+                // Stage all changes
+                progress.report({ message: 'Staging changes...' });
+                execSync('git add .', { cwd: directory });
+                
+                // Commit with issue key and summary
+                progress.report({ message: 'Committing changes...' });
+                const commitMessage = `${issueKey}: ${issueDetails.summary}`;
+                execSync(`git commit -m "${commitMessage.replace(/"/g, '\\\\"')}"`, { cwd: directory });
+                
+                // Get current branch name
+                const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: directory }).toString().trim();
+                
+                // Push to remote
+                progress.report({ message: 'Publishing branch to GitHub...' });
+                try {
+                    execSync(`git push -u origin ${currentBranch}`, { cwd: directory, stdio: 'pipe' });
+                } catch (pushError) {
+                    vscode.window.showErrorMessage('Failed to push to GitHub. Make sure you have a remote repository configured.');
+                    return;
+                }
+                
+                // Create PR using GitHub REST API
+                progress.report({ message: 'Creating pull request...' });
+                try {
+                    const prTitle = issueDetails.summary;
+                    const prBody = issueDetails.description || 'No description provided';
+                    
+                    await this._createGitHubPR(directory, currentBranch, prTitle, prBody);
+                    
+                    vscode.window.showInformationMessage(`Pull request created for ${issueKey}!`);
+                } catch (prError) {
+                    const errorMsg = prError instanceof Error ? prError.message : String(prError);
+                    vscode.window.showWarningMessage(`Could not create PR: ${errorMsg}`);
+                }
+                
+                // Transition Jira to Validation
+                progress.report({ message: 'Updating Jira status to Validation...' });
+                await this._transitionIssueToValidation(config, issueKey);
+                
+                // Refresh issue list
+                progress.report({ message: 'Refreshing issue list...' });
+                await this._fetchJiraIssues();
+                
+                vscode.window.showInformationMessage(`${issueKey} marked as resolved and ready for validation!`);
+            });
+        } catch (error) {
+            vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    private async _getIssueDetails(config: JiraConfig, issueKey: string): Promise<{ summary: string; description: string }> {
+        const authHeader = config.type === 'cloud'
+            ? 'Basic ' + Buffer.from(`${config.email}:${config.apiToken}`).toString('base64')
+            : 'Basic ' + Buffer.from(`${config.username}:${config.password}`).toString('base64');
+
+        const baseUrl = config.url.endsWith('/') ? config.url.slice(0, -1) : config.url;
+        const apiPath = config.type === 'cloud' ? '/rest/api/3/issue/' : '/rest/api/2/issue/';
+        const url = `${baseUrl}${apiPath}${issueKey}?fields=summary,description`;
+
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Authorization': authHeader,
+                'Accept': 'application/json'
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch issue details: ${response.status}`);
+        }
+
+        const issue = await response.json() as any;
+        let description = '';
+        
+        if (issue.fields.description) {
+            if (typeof issue.fields.description === 'string') {
+                description = issue.fields.description;
+            } else if (issue.fields.description.content) {
+                description = this._extractTextFromADF(issue.fields.description);
+            }
+        }
+        
+        return {
+            summary: issue.fields.summary,
+            description: description
+        };
+    }
+
+    private async _transitionIssueToValidation(config: JiraConfig, issueKey: string): Promise<void> {
+        try {
+            const authHeader = config.type === 'cloud'
+                ? 'Basic ' + Buffer.from(`${config.email}:${config.apiToken}`).toString('base64')
+                : 'Basic ' + Buffer.from(`${config.username}:${config.password}`).toString('base64');
+
+            const baseUrl = config.url.endsWith('/') ? config.url.slice(0, -1) : config.url;
+            const apiPath = config.type === 'cloud' ? '/rest/api/3/issue/' : '/rest/api/2/issue/';
+
+            // Get available transitions
+            const transitionsUrl = `${baseUrl}${apiPath}${issueKey}/transitions`;
+            const transitionsResponse = await fetch(transitionsUrl, {
+                method: 'GET',
+                headers: {
+                    'Authorization': authHeader,
+                    'Accept': 'application/json'
+                }
+            });
+
+            if (!transitionsResponse.ok) {
+                throw new Error(`Failed to get transitions: ${transitionsResponse.status}`);
+            }
+
+            const transitionsData = await transitionsResponse.json() as any;
+            const transitions = transitionsData.transitions || [];
+
+            // Find the validation transition
+            const validationTransition = transitions.find((t: any) => 
+                t.name.toLowerCase().includes('validation') ||
+                t.name.toLowerCase().includes('review') ||
+                t.name.toLowerCase().includes('test') ||
+                t.to.name.toLowerCase().includes('validation') ||
+                t.to.name.toLowerCase().includes('review')
+            );
+
+            if (!validationTransition) {
+                vscode.window.showWarningMessage(
+                    `No "Validation" or "Review" transition found for ${issueKey}. Available: ${transitions.map((t: any) => t.name).join(', ')}`
+                );
+                return;
+            }
+
+            // Transition the issue
+            const transitionUrl = `${baseUrl}${apiPath}${issueKey}/transitions`;
+            const transitionResponse = await fetch(transitionUrl, {
+                method: 'POST',
+                headers: {
+                    'Authorization': authHeader,
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    transition: {
+                        id: validationTransition.id
+                    }
+                })
+            });
+
+            if (!transitionResponse.ok) {
+                const errorText = await transitionResponse.text();
+                throw new Error(`Failed to transition: ${transitionResponse.status} - ${errorText}`);
+            }
+
+            vscode.window.showInformationMessage(`${issueKey} transitioned to "${validationTransition.to.name}"`);
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            console.error('Error transitioning to validation:', errorMsg);
+            vscode.window.showWarningMessage(`Could not update status: ${errorMsg}`);
+        }
     }
 
     private async _createUnitTests(directory: string, issueKey: string): Promise<void> {
@@ -1617,6 +1799,18 @@ Please generate and run the unit tests now.`;
             opacity: 0.5;
             cursor: not-allowed;
         }
+        .btn-resolve {
+            background-color: var(--vscode-testing-iconPassed);
+            color: var(--vscode-button-foreground);
+            font-weight: 500;
+        }
+        .btn-resolve:hover:not(:disabled) {
+            opacity: 0.9;
+        }
+        .btn-resolve:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
         .empty-state {
             text-align: center;
             padding: 32px 16px;
@@ -1730,6 +1924,22 @@ Please generate and run the unit tests now.`;
             });
         }
         
+        function markResolved(issueKey) {
+            const directory = document.getElementById('codeDirectory').value;
+            
+            if (!directory || directory === 'No directory selected') {
+                updateStatus('⚠️ Please select a workspace directory first');
+                return;
+            }
+            
+            updateStatus('Resolving ' + issueKey + '...');
+            vscode.postMessage({ 
+                type: 'markResolved',
+                directory: directory,
+                issueKey: issueKey
+            });
+        }
+        
         function updateStatus(message) {
             document.getElementById('statusBar').textContent = message;
         }
@@ -1804,6 +2014,7 @@ Please generate and run the unit tests now.`;
                             <div class="issue-actions">
                                 <button class="btn btn-start" onclick="startWork('\${issue.key}')" \${isInProgress ? 'disabled' : ''}>▶ Start</button>
                                 <button class="btn btn-test" onclick="createUnitTests('\${issue.key}')" \${!isInProgress ? 'disabled' : ''}>🧪 Create Unit Tests</button>
+                                <button class="btn btn-resolve" onclick="markResolved('\${issue.key}')" \${!isInProgress ? 'disabled' : ''}>✔ Mark Resolved</button>
                             </div>
                         \`;
                         
