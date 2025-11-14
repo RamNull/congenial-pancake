@@ -444,13 +444,188 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
                 location: vscode.ProgressLocation.Notification,
                 title: `Fetching full details for ${issueKey}...`,
                 cancellable: false
-            }, async () => {
-                const fullIssueData = await this._fetchFullIssueDetails(config, issueKey);
-                await this._executeWithContext(directory, fullIssueData);
+            }, async (progress) => {
+                progress.report({ message: 'Loading issue details...' });
+                const result = await this._fetchFullIssueDetailsWithAttachments(config, issueKey);
+                
+                progress.report({ message: 'Opening workspace...' });
+                await this._executeWithContextAndFiles(directory, result.context, result.attachmentFiles);
             });
         } catch (error) {
             vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : String(error)}`);
         }
+    }
+
+    private async _fetchFullIssueDetailsWithAttachments(config: JiraConfig, issueKey: string): Promise<{ context: string; attachmentFiles: string[] }> {
+        const authHeader = config.type === 'cloud'
+            ? 'Basic ' + Buffer.from(`${config.email}:${config.apiToken}`).toString('base64')
+            : 'Basic ' + Buffer.from(`${config.username}:${config.password}`).toString('base64');
+
+        const apiPath = config.type === 'cloud' 
+            ? '/rest/api/3/issue/' 
+            : '/rest/api/2/issue/';
+
+        const baseUrl = config.url.endsWith('/') ? config.url.slice(0, -1) : config.url;
+        const url = `${baseUrl}${apiPath}${issueKey}?fields=*all&expand=renderedFields`;
+
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Authorization': authHeader,
+                'Accept': 'application/json'
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch issue ${issueKey}: ${response.status} ${response.statusText}`);
+        }
+
+        const issue = await response.json() as any;
+        const attachmentFiles: string[] = [];
+
+        // Build comprehensive context
+        let context = await this._buildIssueContext(issue, authHeader, attachmentFiles);
+
+        return { context, attachmentFiles };
+    }
+
+    private async _buildIssueContext(issue: any, authHeader: string, attachmentFiles: string[]): Promise<string> {
+        let context = `# Jira Issue: ${issue.key} - ${issue.fields.summary}\n\n`;
+        
+        // Metadata
+        context += `## Metadata\n`;
+        context += `- **Status:** ${issue.fields.status.name}\n`;
+        context += `- **Priority:** ${issue.fields.priority?.name || 'None'}\n`;
+        context += `- **Type:** ${issue.fields.issuetype.name}\n`;
+        context += `- **Assignee:** ${issue.fields.assignee?.displayName || 'Unassigned'}\n`;
+        context += `- **Reporter:** ${issue.fields.reporter?.displayName || 'Unknown'}\n`;
+        context += `- **Created:** ${issue.fields.created}\n`;
+        context += `- **Updated:** ${issue.fields.updated}\n`;
+        
+        if (issue.fields.labels && issue.fields.labels.length > 0) {
+            context += `- **Labels:** ${issue.fields.labels.join(', ')}\n`;
+        }
+
+        // Description
+        context += `\n## Description\n`;
+        if (issue.fields.description) {
+            if (typeof issue.fields.description === 'string') {
+                context += issue.fields.description;
+            } else if (issue.fields.description.content) {
+                context += this._extractTextFromADF(issue.fields.description);
+            } else {
+                context += JSON.stringify(issue.fields.description, null, 2);
+            }
+        } else {
+            context += 'No description provided.';
+        }
+
+        // Comments
+        if (issue.fields.comment && issue.fields.comment.comments && issue.fields.comment.comments.length > 0) {
+            context += `\n\n## Comments (${issue.fields.comment.total})\n`;
+            issue.fields.comment.comments.forEach((comment: any, index: number) => {
+                context += `\n### Comment ${index + 1} by ${comment.author.displayName} (${comment.created})\n`;
+                
+                let commentText = '';
+                if (typeof comment.body === 'string') {
+                    commentText = comment.body;
+                } else if (comment.body && comment.body.content) {
+                    commentText = this._extractTextFromADF(comment.body);
+                } else {
+                    commentText = JSON.stringify(comment.body, null, 2);
+                }
+                
+                context += commentText + '\n';
+            });
+        }
+
+        // Attachments - Download to workspace .jira-context folder
+        if (issue.fields.attachment && issue.fields.attachment.length > 0) {
+            context += `\n## Attachments (${issue.fields.attachment.length})\n`;
+            context += `*Note: Attachment files have been downloaded to .jira-context/${issue.key}/ and opened in the editor for Copilot to reference.*\n\n`;
+            
+            const fs = await import('node:fs');
+            const path = await import('node:path');
+            
+            // Get workspace folder - will be created in the target directory
+            const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            if (!workspaceRoot) {
+                context += `  ⚠ No workspace open - attachments cannot be downloaded\n`;
+                return context;
+            }
+            
+            // Create .jira-context directory for attachments
+            const jiraContextDir = path.join(workspaceRoot, '.jira-context', issue.key);
+            if (!fs.existsSync(jiraContextDir)) {
+                fs.mkdirSync(jiraContextDir, { recursive: true });
+            }
+            
+            for (const att of issue.fields.attachment) {
+                context += `- **${att.filename}** (${Math.round(att.size / 1024)} KB) - ${att.mimeType}\n`;
+                
+                // Download attachments that are useful for Copilot (< 5MB)
+                const maxSize = 5 * 1024 * 1024;
+                
+                if (att.size < maxSize) {
+                    try {
+                        const attachmentResponse = await fetch(att.content, {
+                            method: 'GET',
+                            headers: {
+                                'Authorization': authHeader,
+                                'Accept': '*/*'
+                            }
+                        });
+                        
+                        if (attachmentResponse.ok) {
+                            const buffer = Buffer.from(await attachmentResponse.arrayBuffer());
+                            const filePath = path.join(jiraContextDir, att.filename);
+                            fs.writeFileSync(filePath, buffer);
+                            attachmentFiles.push(filePath);
+                            context += `  ✓ Downloaded to .jira-context/${issue.key}/${att.filename}\n`;
+                        }
+                    } catch (downloadError) {
+                        context += `  ⚠ Could not download (URL: ${att.content})\n`;
+                    }
+                } else {
+                    context += `  ⚠ Too large to include (${Math.round(att.size / 1024 / 1024)} MB)\n`;
+                }
+            }
+            context += '\n';
+        }
+
+        // Subtasks
+        if (issue.fields.subtasks && issue.fields.subtasks.length > 0) {
+            context += `\n## Subtasks (${issue.fields.subtasks.length})\n`;
+            issue.fields.subtasks.forEach((subtask: any) => {
+                context += `- ${subtask.key}: ${subtask.fields.summary} [${subtask.fields.status.name}]\n`;
+            });
+        }
+
+        // Issue Links
+        if (issue.fields.issuelinks && issue.fields.issuelinks.length > 0) {
+            context += `\n## Linked Issues\n`;
+            issue.fields.issuelinks.forEach((link: any) => {
+                if (link.outwardIssue) {
+                    context += `- ${link.type.outward}: ${link.outwardIssue.key} - ${link.outwardIssue.fields.summary}\n`;
+                } else if (link.inwardIssue) {
+                    context += `- ${link.type.inward}: ${link.inwardIssue.key} - ${link.inwardIssue.fields.summary}\n`;
+                }
+            });
+        }
+
+        // Add explicit instruction to use the attachment files
+        if (attachmentFiles.length > 0) {
+            context += `\n\n---\n**Attachment Files Context:**\nThe following files from the Jira issue have been downloaded and are now in the workspace:\n`;
+            for (const filePath of attachmentFiles) {
+                const fileName = filePath.split(/[\\/]/).pop() || filePath;
+                context += `- ${fileName}\n`;
+            }
+            context += `\nPlease review these files as they contain important context for this task.\n`;
+        }
+        
+        context += `\n**Task:** Analyze this codebase and the attached files to provide guidance on implementing this Jira issue. Suggest an implementation approach and identify relevant files that need to be modified.`;
+
+        return context;
     }
 
     private async _fetchFullIssueDetails(config: JiraConfig, issueKey: string): Promise<string> {
@@ -500,9 +675,14 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
         context += `\n## Description\n`;
         if (issue.fields.description) {
             // Jira descriptions can be in various formats
-            context += typeof issue.fields.description === 'string' 
-                ? issue.fields.description 
-                : JSON.stringify(issue.fields.description, null, 2);
+            if (typeof issue.fields.description === 'string') {
+                context += issue.fields.description;
+            } else if (issue.fields.description.content) {
+                // Parse Jira's ADF (Atlassian Document Format)
+                context += this._extractTextFromADF(issue.fields.description);
+            } else {
+                context += JSON.stringify(issue.fields.description, null, 2);
+            }
         } else {
             context += 'No description provided.';
         }
@@ -512,20 +692,83 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
             context += `\n\n## Comments (${issue.fields.comment.total})\n`;
             issue.fields.comment.comments.forEach((comment: any, index: number) => {
                 context += `\n### Comment ${index + 1} by ${comment.author.displayName} (${comment.created})\n`;
-                context += typeof comment.body === 'string' 
-                    ? comment.body 
-                    : JSON.stringify(comment.body, null, 2);
-                context += '\n';
+                
+                // Extract text from Jira's structured comment format
+                let commentText = '';
+                if (typeof comment.body === 'string') {
+                    commentText = comment.body;
+                } else if (comment.body && comment.body.content) {
+                    // Parse Jira's ADF (Atlassian Document Format)
+                    commentText = this._extractTextFromADF(comment.body);
+                } else {
+                    commentText = JSON.stringify(comment.body, null, 2);
+                }
+                
+                context += commentText + '\n';
             });
         }
 
         // Attachments
         if (issue.fields.attachment && issue.fields.attachment.length > 0) {
             context += `\n## Attachments (${issue.fields.attachment.length})\n`;
-            issue.fields.attachment.forEach((att: any) => {
-                context += `- **${att.filename}** (${Math.round(att.size / 1024)} KB) - ${att.mimeType}\n`;
-                context += `  URL: ${att.content}\n`;
-            });
+            
+            for (const att of issue.fields.attachment) {
+                context += `\n### ${att.filename} (${Math.round(att.size / 1024)} KB)\n`;
+                context += `- **Type:** ${att.mimeType}\n`;
+                context += `- **URL:** ${att.content}\n`;
+                
+                // Download and include attachment content for text files, images, and documents
+                const isTextFile = att.mimeType?.includes('text/') || 
+                                   att.mimeType?.includes('application/json') ||
+                                   att.mimeType?.includes('application/yaml') ||
+                                   att.mimeType?.includes('application/yml') ||
+                                   att.filename?.endsWith('.md') ||
+                                   att.filename?.endsWith('.txt') ||
+                                   att.filename?.endsWith('.json') ||
+                                   att.filename?.endsWith('.yaml') ||
+                                   att.filename?.endsWith('.yml') ||
+                                   att.filename?.endsWith('.xml');
+                
+                const isImage = att.mimeType?.startsWith('image/');
+                const isDocument = att.mimeType?.includes('application/pdf') ||
+                                   att.mimeType?.includes('application/msword') ||
+                                   att.mimeType?.includes('application/vnd.openxmlformats');
+                
+                // Only download if file is reasonably sized (< 5MB for text, < 2MB for images/docs)
+                const maxSize = isTextFile ? 5 * 1024 * 1024 : 2 * 1024 * 1024;
+                
+                if ((isTextFile || isImage || isDocument) && att.size < maxSize) {
+                    try {
+                        const attachmentResponse = await fetch(att.content, {
+                            method: 'GET',
+                            headers: {
+                                'Authorization': authHeader,
+                                'Accept': '*/*'
+                            }
+                        });
+                        
+                        if (attachmentResponse.ok) {
+                            if (isTextFile) {
+                                // Include text content directly
+                                const textContent = await attachmentResponse.text();
+                                context += `\n**Content:**\n\`\`\`\n${textContent}\n\`\`\`\n`;
+                            } else if (isImage) {
+                                // For images, note that they're available (Copilot can access via URL)
+                                context += `\n**Note:** Image file available at the URL above. Copilot can reference this image.\n`;
+                            } else if (isDocument) {
+                                // For documents, note availability
+                                context += `\n**Note:** Document file available at the URL above.\n`;
+                            }
+                        }
+                    } catch (downloadError) {
+                        context += `\n**Note:** Could not download attachment content. File available at URL above.\n`;
+                    }
+                } else if (att.size >= maxSize) {
+                    context += `\n**Note:** File too large to include in context (${Math.round(att.size / 1024 / 1024)} MB). URL provided above.\n`;
+                }
+                
+                context += '\n';
+            }
         }
 
         // Subtasks
@@ -551,6 +794,82 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
         context += `\n\n---\n**Task:** Please analyze this codebase in the context of implementing this Jira issue. Provide guidance, suggest implementation approach, and identify relevant files that need to be modified.`;
 
         return context;
+    }
+
+    /**
+     * Extract readable text from Jira's Atlassian Document Format (ADF)
+     */
+    private _extractTextFromADF(adf: any): string {
+        if (!adf || !adf.content) {
+            return '';
+        }
+
+        let text = '';
+        
+        const processNode = (node: any): string => {
+            let result = '';
+            
+            if (node.type === 'text') {
+                result += node.text;
+            } else if (node.type === 'hardBreak') {
+                result += '\n';
+            } else if (node.type === 'paragraph') {
+                if (node.content) {
+                    node.content.forEach((child: any) => {
+                        result += processNode(child);
+                    });
+                }
+                result += '\n\n';
+            } else if (node.type === 'heading') {
+                const level = node.attrs?.level || 1;
+                const prefix = '#'.repeat(level);
+                if (node.content) {
+                    result += prefix + ' ';
+                    node.content.forEach((child: any) => {
+                        result += processNode(child);
+                    });
+                }
+                result += '\n\n';
+            } else if (node.type === 'bulletList' || node.type === 'orderedList') {
+                if (node.content) {
+                    node.content.forEach((item: any, index: number) => {
+                        const bullet = node.type === 'bulletList' ? '- ' : `${index + 1}. `;
+                        result += bullet + processNode(item).trim() + '\n';
+                    });
+                }
+                result += '\n';
+            } else if (node.type === 'listItem') {
+                if (node.content) {
+                    node.content.forEach((child: any) => {
+                        result += processNode(child).trim() + ' ';
+                    });
+                }
+            } else if (node.type === 'codeBlock') {
+                result += '```\n';
+                if (node.content) {
+                    node.content.forEach((child: any) => {
+                        result += processNode(child);
+                    });
+                }
+                result += '\n```\n\n';
+            } else if (node.type === 'inlineCard' || node.type === 'blockCard') {
+                const url = node.attrs?.url || '';
+                result += url ? `[${url}](${url})` : '';
+            } else if (node.content) {
+                // Generic handler for nodes with content
+                node.content.forEach((child: any) => {
+                    result += processNode(child);
+                });
+            }
+            
+            return result;
+        };
+
+        adf.content.forEach((node: any) => {
+            text += processNode(node);
+        });
+
+        return text.trim();
     }
 
     private async _executeWithJiraIssue(directory: string, issueKey: string): Promise<void> {
@@ -599,39 +918,27 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async _executeWithContext(directory: string, payload: string): Promise<void> {
+    private async _executeWithContextAndFiles(directory: string, payload: string, attachmentFiles: string[]): Promise<void> {
         try {
             const folderUri = vscode.Uri.file(directory);
             const currentWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
             
             // Check if the directory is already open
             if (currentWorkspace === directory) {
-                // Directory is already open, execute prompt directly
-                try {
-                    await vscode.commands.executeCommand('workbench.panel.chat.view.copilot.focus');
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                    
-                    await vscode.commands.executeCommand('workbench.action.chat.open', {
-                        query: payload
-                    });
-                    vscode.window.showInformationMessage('Prompt sent to GitHub Copilot Chat!');
-                } catch {
-                    vscode.window.showInformationMessage(
-                        `Copy this prompt to Copilot Chat: ${payload}`,
-                        'Copy Prompt'
-                    ).then(selection => {
-                        if (selection === 'Copy Prompt') {
-                            vscode.env.clipboard.writeText(payload);
-                            vscode.window.showInformationMessage('Prompt copied to clipboard!');
-                        }
-                    });
-                }
+                // Directory is already open, execute prompt with attachments
+                await this._sendToCopilotWithAttachments(payload, attachmentFiles);
             } else {
                 // Different directory, need to open it
-                // Save the payload to execute after reload
+                // Save the payload and attachments to execute after reload
                 await vscode.workspace.getConfiguration().update(
                     'copilotContextExecutor.pendingPrompt', 
                     payload, 
+                    vscode.ConfigurationTarget.Global
+                );
+                
+                await vscode.workspace.getConfiguration().update(
+                    'copilotContextExecutor.pendingAttachments', 
+                    attachmentFiles, 
                     vscode.ConfigurationTarget.Global
                 );
                 
@@ -645,6 +952,56 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    private async _sendToCopilotWithAttachments(payload: string, attachmentFiles: string[]): Promise<void> {
+        try {
+            // Open attachment files in editor tabs so Copilot can access them
+            if (attachmentFiles.length > 0) {
+                for (const filePath of attachmentFiles) {
+                    const uri = vscode.Uri.file(filePath);
+                    await vscode.window.showTextDocument(uri, { preview: false, preserveFocus: true });
+                }
+                // Small delay to ensure files are loaded
+                await new Promise(resolve => setTimeout(resolve, 300));
+            }
+            
+            // Open Copilot Chat
+            await vscode.commands.executeCommand('workbench.panel.chat.view.copilot.focus');
+            await new Promise(resolve => setTimeout(resolve, 500));
+            
+            // Send the prompt
+            await vscode.commands.executeCommand('workbench.action.chat.open', {
+                query: payload
+            });
+            
+            const attachmentCount = attachmentFiles.length;
+            let attachmentMsg = '';
+            
+            if (attachmentCount > 0) {
+                const fileNames = attachmentFiles.map(f => f.split(/[\\/]/).pop()).join(', ');
+                attachmentMsg = ` (${attachmentCount} file(s) opened: ${fileNames}. Copilot will analyze them automatically!)`;
+            }
+            
+            vscode.window.showInformationMessage(
+                `Prompt sent to Copilot Chat${attachmentMsg}`
+            );
+        } catch (error) {
+            // Fallback: copy to clipboard
+            vscode.window.showInformationMessage(
+                `Copy this prompt to Copilot Chat: ${payload}\n\nAttachments saved to: ${attachmentFiles.join(', ')}`,
+                'Copy Prompt'
+            ).then(selection => {
+                if (selection === 'Copy Prompt') {
+                    vscode.env.clipboard.writeText(payload);
+                    vscode.window.showInformationMessage('Prompt copied to clipboard!');
+                }
+            });
+        }
+    }
+
+    private async _executeWithContext(directory: string, payload: string): Promise<void> {
+        await this._executeWithContextAndFiles(directory, payload, []);
+    }
+
     private _getHtmlForWebview(webview: vscode.Webview) {
         return `<!DOCTYPE html>
 <html lang="en">
@@ -653,140 +1010,269 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Copilot Context Executor</title>
     <style>
-        body {
-            padding: 15px;
-            font-family: var(--vscode-font-family);
-            color: var(--vscode-foreground);
-        }
-        h3 {
-            margin-top: 0;
-            margin-bottom: 20px;
-        }
-        .input-group {
-            margin-bottom: 15px;
-        }
-        label {
-            display: block;
-            margin-bottom: 5px;
-            font-size: 0.9em;
-            font-weight: 600;
-        }
-        input[type="text"], textarea, select {
-            width: 100%;
-            padding: 8px;
-            background-color: var(--vscode-input-background);
-            color: var(--vscode-input-foreground);
-            border: 1px solid var(--vscode-input-border);
-            border-radius: 2px;
+        * {
             box-sizing: border-box;
+            margin: 0;
+            padding: 0;
         }
-        select {
-            cursor: pointer;
-        }
-        textarea {
-            min-height: 80px;
-            resize: vertical;
+        body {
+            padding: 0;
             font-family: var(--vscode-font-family);
+            font-size: var(--vscode-font-size);
+            color: var(--vscode-foreground);
+            background-color: var(--vscode-sideBar-background);
         }
-        input[type="text"]:focus, textarea:focus, select:focus {
-            outline: 1px solid var(--vscode-focusBorder);
+        .section {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border);
         }
-        button {
-            width: 100%;
-            padding: 10px;
-            margin-top: 10px;
-            background-color: var(--vscode-button-background);
-            color: var(--vscode-button-foreground);
-            border: none;
-            cursor: pointer;
-            border-radius: 2px;
-            font-weight: 600;
-        }
-        button:hover {
-            background-color: var(--vscode-button-hoverBackground);
-        }
-        button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        .browse-btn, .small-btn {
-            padding: 6px 10px;
-            margin-top: 5px;
-            width: auto;
-            font-size: 0.85em;
-        }
-        .status {
-            font-size: 0.85em;
-            margin-top: 5px;
-            opacity: 0.8;
-        }
-        .hidden { display: none; }
-        .issue-item {
-            padding: 10px;
-            margin: 5px 0;
-            background-color: var(--vscode-editor-background);
-            border: 1px solid var(--vscode-input-border);
-            border-radius: 3px;
+        .section-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
+            margin-bottom: 8px;
         }
-        .issue-item:hover {
-            background-color: var(--vscode-list-hoverBackground);
-        }
-        .issue-info {
-            flex: 1;
-        }
-        .issue-key {
+        .section-title {
+            font-size: 11px;
             font-weight: 600;
-            color: var(--vscode-textLink-foreground);
+            text-transform: uppercase;
+            color: var(--vscode-sideBarTitle-foreground);
+            letter-spacing: 0.5px;
         }
-        .issue-summary {
-            font-size: 0.9em;
-            margin-top: 2px;
+        .input-field {
+            width: 100%;
+            padding: 4px 8px;
+            background-color: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            border: 1px solid var(--vscode-input-border);
+            font-size: 13px;
+            font-family: var(--vscode-font-family);
         }
-        .issue-status {
-            font-size: 0.8em;
-            opacity: 0.7;
-            margin-top: 2px;
+        .input-field:focus {
+            outline: 1px solid var(--vscode-focusBorder);
+            border-color: var(--vscode-focusBorder);
         }
-        .work-btn {
-            padding: 6px 12px;
+        .input-field:read-only {
+            color: var(--vscode-input-placeholderForeground);
+        }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 4px 12px;
             background-color: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
             border: none;
             cursor: pointer;
+            font-size: 13px;
+            font-family: var(--vscode-font-family);
+            font-weight: 400;
+            white-space: nowrap;
+        }
+        .btn:hover {
+            background-color: var(--vscode-button-hoverBackground);
+        }
+        .btn:active {
+            background-color: var(--vscode-button-background);
+            opacity: 0.9;
+        }
+        .btn-secondary {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+        }
+        .btn-secondary:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .btn-icon {
+            padding: 4px 8px;
+            font-size: 11px;
+        }
+        .button-group {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .issues-container {
+            max-height: calc(100vh - 300px);
+            overflow-y: auto;
+            margin-top: 8px;
+        }
+        .issue-card {
+            padding: 12px;
+            margin-bottom: 8px;
+            background-color: var(--vscode-list-inactiveSelectionBackground);
+            border-left: 3px solid var(--vscode-textLink-foreground);
+            cursor: pointer;
+            transition: background-color 0.1s;
+        }
+        .issue-card:hover {
+            background-color: var(--vscode-list-hoverBackground);
+        }
+        .issue-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+        .issue-key {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--vscode-textLink-foreground);
+            font-family: var(--vscode-editor-font-family);
+        }
+        .issue-type-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            background-color: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
             border-radius: 2px;
-            font-size: 0.85em;
+            text-transform: uppercase;
             font-weight: 600;
         }
-        .work-btn:hover {
+        .issue-title {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--vscode-foreground);
+            margin-bottom: 8px;
+            line-height: 1.4;
+        }
+        .issue-description {
+            font-size: 12px;
+            color: var(--vscode-descriptionForeground);
+            margin-bottom: 8px;
+            line-height: 1.5;
+            max-height: 60px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            display: -webkit-box;
+            -webkit-line-clamp: 3;
+            -webkit-box-orient: vertical;
+        }
+        .issue-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+            margin-bottom: 8px;
+        }
+        .meta-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .meta-label {
+            opacity: 0.7;
+        }
+        .meta-value {
+            font-weight: 500;
+        }
+        .status-badge {
+            padding: 2px 6px;
+            border-radius: 2px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .status-todo {
+            background-color: rgba(100, 100, 100, 0.2);
+            color: var(--vscode-foreground);
+        }
+        .status-inprogress {
+            background-color: rgba(33, 150, 243, 0.2);
+            color: #2196F3;
+        }
+        .status-done {
+            background-color: rgba(76, 175, 80, 0.2);
+            color: #4CAF50;
+        }
+        .priority-high {
+            color: #f44336;
+        }
+        .priority-medium {
+            color: #ff9800;
+        }
+        .priority-low {
+            color: #4caf50;
+        }
+        .issue-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .btn-start {
+            flex: 1;
+            background-color: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            font-weight: 500;
+        }
+        .btn-start:hover {
             background-color: var(--vscode-button-hoverBackground);
+        }
+        .empty-state {
+            text-align: center;
+            padding: 32px 16px;
+            color: var(--vscode-descriptionForeground);
+        }
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 12px;
+            opacity: 0.3;
+        }
+        .empty-state-text {
+            font-size: 13px;
+            margin-bottom: 16px;
+        }
+        .status-bar {
+            padding: 8px 16px;
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+            background-color: var(--vscode-sideBar-background);
+            border-top: 1px solid var(--vscode-sideBarSectionHeader-border);
+        }
+        ::-webkit-scrollbar {
+            width: 10px;
+        }
+        ::-webkit-scrollbar-track {
+            background: var(--vscode-scrollbarSlider-background);
+        }
+        ::-webkit-scrollbar-thumb {
+            background: var(--vscode-scrollbarSlider-hoverBackground);
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--vscode-scrollbarSlider-activeBackground);
         }
     </style>
 </head>
 <body>
-    <h3>Copilot Context Executor</h3>
-    
-    <div class="input-group">
-        <label for="codeDirectory">Code Directory</label>
-        <input type="text" id="codeDirectory" placeholder="Select code directory..." readonly />
-        <button class="browse-btn" onclick="browseDirectory()">📁 Browse</button>
-    </div>
-    
-    <div class="input-group">
-        <label>Jira Issues</label>
-        <div id="issuesList" style="max-height: 300px; overflow-y: auto; border: 1px solid var(--vscode-input-border); border-radius: 2px; padding: 5px;">
-            <div style="text-align: center; padding: 20px; opacity: 0.6;">No issues loaded. Click "Refresh Issues" below.</div>
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">📁 Workspace</div>
         </div>
-        <button class="small-btn" onclick="configureJira()">⚙️ Configure Jira</button>
-        <button class="small-btn" onclick="fetchIssues()">🔄 Refresh Issues</button>
-        <div class="status" id="jiraStatus"></div>
+        <input type="text" id="codeDirectory" class="input-field" placeholder="No directory selected" readonly />
+        <div class="button-group">
+            <button class="btn btn-secondary" onclick="browseDirectory()">Browse...</button>
+        </div>
     </div>
     
-    <button onclick="executePrompt()" id="sendBtn">
-        ▶ Send to Copilot
-    </button>
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">🎫 Jira Issues</div>
+            <button class="btn-icon btn-secondary" onclick="fetchIssues()" title="Refresh Issues">🔄</button>
+        </div>
+        <div class="issues-container" id="issuesList">
+            <div class="empty-state">
+                <div class="empty-state-icon">📋</div>
+                <div class="empty-state-text">No issues loaded</div>
+                <button class="btn btn-secondary" onclick="fetchIssues()">Load Issues</button>
+            </div>
+        </div>
+        <div class="button-group">
+            <button class="btn btn-secondary" onclick="configureJira()">⚙️ Configure Jira</button>
+        </div>
+    </div>
+    
+    <div class="status-bar" id="statusBar">Ready</div>
     
     <script>
         const vscode = acquireVsCodeApi();
@@ -800,18 +1286,19 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
         }
         
         function fetchIssues() {
-            document.getElementById('jiraStatus').textContent = 'Fetching issues...';
+            updateStatus('Fetching issues...');
             vscode.postMessage({ type: 'fetchJiraIssues' });
         }
         
         function startWork(issueKey) {
             const directory = document.getElementById('codeDirectory').value;
             
-            if (!directory) {
-                alert('Please select a code directory first');
+            if (!directory || directory === 'No directory selected') {
+                updateStatus('⚠️ Please select a workspace directory first');
                 return;
             }
             
+            updateStatus('Loading issue ' + issueKey + '...');
             vscode.postMessage({ 
                 type: 'startWork',
                 directory: directory,
@@ -819,46 +1306,87 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
             });
         }
         
-        function executePrompt() {
-            alert('Please use the "Start Work" button on an issue instead');
+        function updateStatus(message) {
+            document.getElementById('statusBar').textContent = message;
+        }
+        
+        function getStatusClass(status) {
+            const statusLower = status.toLowerCase();
+            if (statusLower.includes('done') || statusLower.includes('complete')) return 'status-done';
+            if (statusLower.includes('progress') || statusLower.includes('active')) return 'status-inprogress';
+            return 'status-todo';
+        }
+        
+        function getPriorityClass(priority) {
+            const priorityLower = priority.toLowerCase();
+            if (priorityLower.includes('high') || priorityLower.includes('critical')) return 'priority-high';
+            if (priorityLower.includes('medium') || priorityLower.includes('normal')) return 'priority-medium';
+            return 'priority-low';
+        }
+        
+        function truncateText(text, maxLength) {
+            if (!text) return 'No description';
+            const plainText = typeof text === 'string' ? text : JSON.stringify(text);
+            return plainText.length > maxLength ? plainText.substring(0, maxLength) + '...' : plainText;
         }
         
         // Listen for messages from the extension
         window.addEventListener('message', event => {
             const message = event.data;
+            
             if (message.type === 'setDirectory') {
                 document.getElementById('codeDirectory').value = message.path;
-            } else if (message.type === 'setIssues') {
+                updateStatus('Workspace: ' + message.path.split('\\\\').pop());
+            } 
+            else if (message.type === 'setIssues') {
                 const issuesList = document.getElementById('issuesList');
                 issuesList.innerHTML = '';
                 
                 if (message.issues.length === 0) {
-                    issuesList.innerHTML = '<div style="text-align: center; padding: 20px; opacity: 0.6;">No issues found</div>';
+                    issuesList.innerHTML = \`
+                        <div class="empty-state">
+                            <div class="empty-state-icon">📭</div>
+                            <div class="empty-state-text">No issues found</div>
+                        </div>
+                    \`;
+                    updateStatus('No issues found');
                 } else {
                     message.issues.forEach(issue => {
-                        const issueDiv = document.createElement('div');
-                        issueDiv.className = 'issue-item';
+                        const issueCard = document.createElement('div');
+                        issueCard.className = 'issue-card';
                         
-                        const infoDiv = document.createElement('div');
-                        infoDiv.className = 'issue-info';
-                        infoDiv.innerHTML = '<div class="issue-key">' + issue.key + '</div>' +
-                                           '<div class="issue-summary">' + issue.summary + '</div>' +
-                                           '<div class="issue-status">Status: ' + issue.status + ' | Priority: ' + issue.priority + '</div>';
+                        const statusClass = getStatusClass(issue.status);
+                        const priorityClass = getPriorityClass(issue.priority);
                         
-                        const btn = document.createElement('button');
-                        btn.className = 'work-btn';
-                        btn.textContent = '▶ Start Work';
-                        btn.onclick = function() { startWork(issue.key); };
+                        issueCard.innerHTML = \`
+                            <div class="issue-header">
+                                <span class="issue-key">\${issue.key}</span>
+                                <span class="issue-type-badge">Task</span>
+                            </div>
+                            <div class="issue-title">\${issue.summary}</div>
+                            <div class="issue-description">\${truncateText(issue.description, 150)}</div>
+                            <div class="issue-meta">
+                                <div class="meta-item">
+                                    <span class="meta-label">Status:</span>
+                                    <span class="status-badge \${statusClass}">\${issue.status}</span>
+                                </div>
+                                <div class="meta-item">
+                                    <span class="meta-label">Priority:</span>
+                                    <span class="meta-value \${priorityClass}">\${issue.priority}</span>
+                                </div>
+                            </div>
+                            <div class="issue-actions">
+                                <button class="btn btn-start" onclick="startWork('\${issue.key}')">▶ Start Working</button>
+                            </div>
+                        \`;
                         
-                        issueDiv.appendChild(infoDiv);
-                        issueDiv.appendChild(btn);
-                        issuesList.appendChild(issueDiv);
+                        issuesList.appendChild(issueCard);
                     });
+                    updateStatus('Loaded ' + message.issues.length + ' issue(s)');
                 }
-                
-                document.getElementById('jiraStatus').textContent = 'Found ' + message.issues.length + ' issue(s)';
-            } else if (message.type === 'setStatus') {
-                document.getElementById('jiraStatus').textContent = message.status;
+            } 
+            else if (message.type === 'setStatus') {
+                updateStatus(message.status);
             }
         });
     </script>
@@ -876,10 +1404,18 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Check if there's a pending prompt to execute
     const pendingPrompt = vscode.workspace.getConfiguration().get<string>('copilotContextExecutor.pendingPrompt');
+    const pendingAttachments = vscode.workspace.getConfiguration().get<string[]>('copilotContextExecutor.pendingAttachments');
+    
     if (pendingPrompt) {
-        // Clear the pending prompt
+        // Clear the pending prompt and attachments
         vscode.workspace.getConfiguration().update(
             'copilotContextExecutor.pendingPrompt', 
+            undefined, 
+            vscode.ConfigurationTarget.Global
+        );
+        
+        vscode.workspace.getConfiguration().update(
+            'copilotContextExecutor.pendingAttachments', 
             undefined, 
             vscode.ConfigurationTarget.Global
         );
@@ -887,13 +1423,33 @@ export function activate(context: vscode.ExtensionContext) {
         // Execute the prompt after a short delay to ensure workspace is fully loaded
         setTimeout(async () => {
             try {
+                // Open attachment files if available
+                if (pendingAttachments && pendingAttachments.length > 0) {
+                    for (const filePath of pendingAttachments) {
+                        const uri = vscode.Uri.file(filePath);
+                        await vscode.window.showTextDocument(uri, { preview: false, preserveFocus: true });
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                }
+                
                 await vscode.commands.executeCommand('workbench.panel.chat.view.copilot.focus');
                 await new Promise(resolve => setTimeout(resolve, 500));
                 
                 await vscode.commands.executeCommand('workbench.action.chat.open', {
                     query: pendingPrompt
                 });
-                vscode.window.showInformationMessage('Prompt sent to GitHub Copilot Chat!');
+                
+                const attachmentCount = pendingAttachments?.length || 0;
+                let attachmentMsg = '';
+                
+                if (attachmentCount > 0 && pendingAttachments) {
+                    const fileNames = pendingAttachments.map(f => f.split(/[\\/]/).pop()).join(', ');
+                    attachmentMsg = ` (${attachmentCount} file(s) opened: ${fileNames}. Copilot will analyze them automatically!)`;
+                }
+                
+                vscode.window.showInformationMessage(
+                    `Prompt sent to Copilot Chat${attachmentMsg}`
+                );
             } catch {
                 vscode.window.showInformationMessage(
                     `Workspace opened. Copy this prompt to Copilot Chat: ${pendingPrompt}`,
