@@ -609,10 +609,15 @@ Please generate and run the unit tests now.`;
                 const contextWithInstructions = result.context + 
                     `\n\n---\n**IMPORTANT INSTRUCTIONS:**\n` +
                     `1. Implement the required changes for this issue\n` +
-                    `2. Validate your implementation if its running or not just by running the basic health check\n` +
-                    `3. **DO NOT create unit tests yet** - unit tests will be created in a separate step after you validate the code\n` +
-                    `4. Once you've validated the code changes, click the "Create Unit Tests" button to generate tests for your changeset\n` +
-                    `5. The unit test generation will analyze only the files you've changed\n`;
+                    `2. **Start the application** using the project's standard command (check package.json scripts, pom.xml, build.gradle, requirements.txt, etc.)\n` +
+                    `   - For Node.js: npm start, npm run dev, or yarn start\n` +
+                    `   - For Python: python app.py, flask run, uvicorn main:app, or python manage.py runserver\n` +
+                    `   - For Java: mvn spring-boot:run, gradle bootRun, or java -jar target/app.jar\n` +
+                    `   - For other frameworks: use the appropriate start command\n` +
+                    `3. **If you need to test endpoints (like /health), ALWAYS open a NEW SEPARATE terminal** - never run test commands in the same terminal where the app is running\n` +
+                    `4. **DO NOT create ANY test files** (no test-api.js, health-check.js, validation scripts, etc.)\n` +
+                    `5. **DO NOT create unit tests** - they will be generated later when you click "Mark Complete"\n` +
+                    `6. Once the app starts successfully, click "Mark Complete" to generate unit tests\n`;
                 
                 progress.report({ message: 'Setting up Git repository...' });
                 const issueType = await this._getIssueType(config, issueKey);
