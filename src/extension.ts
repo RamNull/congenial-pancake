@@ -442,9 +442,12 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
             // Show progress
             await vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
-                title: `Fetching full details for ${issueKey}...`,
+                title: `Starting work on ${issueKey}...`,
                 cancellable: false
             }, async (progress) => {
+                progress.report({ message: 'Transitioning status to In Progress...' });
+                await this._transitionIssueToInProgress(config, issueKey);
+                
                 progress.report({ message: 'Loading issue details...' });
                 const result = await this._fetchFullIssueDetailsWithAttachments(config, issueKey);
                 
@@ -453,6 +456,100 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
             });
         } catch (error) {
             vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    private async _transitionIssueToInProgress(config: JiraConfig, issueKey: string): Promise<void> {
+        try {
+            const authHeader = config.type === 'cloud'
+                ? 'Basic ' + Buffer.from(`${config.email}:${config.apiToken}`).toString('base64')
+                : 'Basic ' + Buffer.from(`${config.username}:${config.password}`).toString('base64');
+
+            const baseUrl = config.url.endsWith('/') ? config.url.slice(0, -1) : config.url;
+            const apiPath = config.type === 'cloud' ? '/rest/api/3/issue/' : '/rest/api/2/issue/';
+
+            // First, get available transitions for this issue
+            const transitionsUrl = `${baseUrl}${apiPath}${issueKey}/transitions`;
+            const transitionsResponse = await fetch(transitionsUrl, {
+                method: 'GET',
+                headers: {
+                    'Authorization': authHeader,
+                    'Accept': 'application/json'
+                }
+            });
+
+            if (!transitionsResponse.ok) {
+                throw new Error(`Failed to get transitions for ${issueKey}: ${transitionsResponse.status}`);
+            }
+
+            const transitionsData = await transitionsResponse.json() as any;
+            const transitions = transitionsData.transitions || [];
+
+            // Find the "In Progress" transition (may have different names)
+            const inProgressTransition = transitions.find((t: any) => 
+                t.name.toLowerCase().includes('in progress') || 
+                t.name.toLowerCase().includes('start') ||
+                t.to.name.toLowerCase().includes('in progress')
+            );
+
+            if (!inProgressTransition) {
+                // If no "In Progress" transition found, check if already in progress
+                const issueUrl = `${baseUrl}${apiPath}${issueKey}?fields=status`;
+                const issueResponse = await fetch(issueUrl, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': authHeader,
+                        'Accept': 'application/json'
+                    }
+                });
+
+                if (issueResponse.ok) {
+                    const issueData = await issueResponse.json() as any;
+                    const currentStatus = issueData.fields.status.name.toLowerCase();
+                    
+                    if (currentStatus.includes('in progress') || currentStatus.includes('active')) {
+                        vscode.window.showInformationMessage(`${issueKey} is already in progress`);
+                        return;
+                    }
+                }
+
+                console.warn(`No "In Progress" transition available for ${issueKey}. Available transitions:`, 
+                    transitions.map((t: any) => t.name).join(', '));
+                vscode.window.showWarningMessage(
+                    `Could not auto-transition ${issueKey} to "In Progress". Current workflow may not support this transition.`
+                );
+                return;
+            }
+
+            // Transition the issue to "In Progress"
+            const transitionUrl = `${baseUrl}${apiPath}${issueKey}/transitions`;
+            const transitionResponse = await fetch(transitionUrl, {
+                method: 'POST',
+                headers: {
+                    'Authorization': authHeader,
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    transition: {
+                        id: inProgressTransition.id
+                    }
+                })
+            });
+
+            if (!transitionResponse.ok) {
+                const errorText = await transitionResponse.text();
+                throw new Error(`Failed to transition ${issueKey}: ${transitionResponse.status} - ${errorText}`);
+            }
+
+            vscode.window.showInformationMessage(`${issueKey} transitioned to "In Progress"`);
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            console.error('Error transitioning issue:', errorMsg);
+            vscode.window.showWarningMessage(
+                `Could not update status to "In Progress": ${errorMsg}`
+            );
+            // Don't throw - allow the workflow to continue even if transition fails
         }
     }
 
@@ -953,41 +1050,47 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async _sendToCopilotWithAttachments(payload: string, attachmentFiles: string[]): Promise<void> {
-        try {
-            // Open attachment files in editor tabs so Copilot can access them
-            if (attachmentFiles.length > 0) {
-                for (const filePath of attachmentFiles) {
-                    const uri = vscode.Uri.file(filePath);
-                    await vscode.window.showTextDocument(uri, { preview: false, preserveFocus: true });
-                }
-                // Small delay to ensure files are loaded
-                await new Promise(resolve => setTimeout(resolve, 300));
+        // Open attachment files in editor tabs so Copilot can access them
+        if (attachmentFiles.length > 0) {
+            for (const filePath of attachmentFiles) {
+                const uri = vscode.Uri.file(filePath);
+                await vscode.window.showTextDocument(uri, { preview: false, preserveFocus: true });
             }
-            
-            // Open Copilot Chat
+            // Small delay to ensure files are loaded
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        
+        // Try to send prompt to Copilot Chat using the working method
+        try {
             await vscode.commands.executeCommand('workbench.panel.chat.view.copilot.focus');
             await new Promise(resolve => setTimeout(resolve, 500));
-            
-            // Send the prompt
+
             await vscode.commands.executeCommand('workbench.action.chat.open', {
                 query: payload
             });
             
             const attachmentCount = attachmentFiles.length;
+            if (attachmentCount > 0) {
+                const fileNames = attachmentFiles.map(f => f.split(/[\\/]/).pop()).join(', ');
+                vscode.window.showInformationMessage(
+                    `Prompt sent to Copilot Chat! ${attachmentCount} file(s) opened: ${fileNames}`
+                );
+            } else {
+                vscode.window.showInformationMessage('Prompt sent to Copilot Chat!');
+            }
+        } catch (error) {
+            console.log('Failed to send prompt automatically:', error);
+            // Fallback: copy to clipboard
+            const attachmentCount = attachmentFiles.length;
             let attachmentMsg = '';
             
             if (attachmentCount > 0) {
                 const fileNames = attachmentFiles.map(f => f.split(/[\\/]/).pop()).join(', ');
-                attachmentMsg = ` (${attachmentCount} file(s) opened: ${fileNames}. Copilot will analyze them automatically!)`;
+                attachmentMsg = `\n\nAttachments opened: ${fileNames}`;
             }
             
             vscode.window.showInformationMessage(
-                `Prompt sent to Copilot Chat${attachmentMsg}`
-            );
-        } catch (error) {
-            // Fallback: copy to clipboard
-            vscode.window.showInformationMessage(
-                `Copy this prompt to Copilot Chat: ${payload}\n\nAttachments saved to: ${attachmentFiles.join(', ')}`,
+                `Copy this prompt to Copilot Chat: ${payload}${attachmentMsg}`,
                 'Copy Prompt'
             ).then(selection => {
                 if (selection === 'Copy Prompt') {
@@ -1376,7 +1479,7 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
                                 </div>
                             </div>
                             <div class="issue-actions">
-                                <button class="btn btn-start" onclick="startWork('\${issue.key}')">▶ Start Working</button>
+                                <button class="btn btn-start" onclick="startWork('\${issue.key}')">▶ Start</button>
                             </div>
                         \`;
                         
