@@ -448,6 +448,9 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
                 title: `Creating unit tests for ${issueKey}...`,
                 cancellable: false
             }, async (progress) => {
+                progress.report({ message: 'Staging changes...' });
+                await this._stageGitChanges(directory);
+                
                 progress.report({ message: 'Getting changeset...' });
                 const changeset = await this._getGitChangeset(directory);
                 
@@ -461,9 +464,28 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
                 
                 progress.report({ message: 'Opening Copilot Chat...' });
                 await this._sendToCopilotWithAttachments(unitTestPrompt, []);
+                
+                // Show success message with next steps
+                vscode.window.showInformationMessage(
+                    `Unit test prompt sent to Copilot! After tests are created, click "Run & Fix Tests".`
+                );
             });
         } catch (error) {
             vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    private async _stageGitChanges(directory: string): Promise<void> {
+        try {
+            const { execSync } = await import('node:child_process');
+            
+            // Stage all changes
+            execSync('git add .', { cwd: directory });
+            
+            console.log('Changes staged successfully');
+        } catch (error) {
+            console.error('Error staging changes:', error);
+            throw new Error('Failed to stage changes. Make sure you have Git initialized.');
         }
     }
 
@@ -471,13 +493,18 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
         try {
             const { execSync } = await import('node:child_process');
             
-            // Get the diff of uncommitted changes
-            const diff = execSync('git diff HEAD', { cwd: directory, encoding: 'utf-8' });
+            // Get the diff of staged changes (what will be committed)
+            const diff = execSync('git diff --cached', { cwd: directory, encoding: 'utf-8' });
             
             if (!diff || diff.trim().length === 0) {
-                // No uncommitted changes, try to get last commit diff
-                const lastCommitDiff = execSync('git diff HEAD~1 HEAD', { cwd: directory, encoding: 'utf-8' });
-                return lastCommitDiff;
+                // No staged changes, check for unstaged changes
+                const unstagedDiff = execSync('git diff', { cwd: directory, encoding: 'utf-8' });
+                
+                if (!unstagedDiff || unstagedDiff.trim().length === 0) {
+                    return '';
+                }
+                
+                return unstagedDiff;
             }
             
             return diff;
@@ -493,25 +520,47 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
 ## Instructions
 You are reviewing the code changes for Jira issue ${issueKey}. The developer has completed their implementation and validated the code.
 
-**Your task**: Generate comprehensive unit tests ONLY for the changed code in this changeset.
+**Your task**: Generate comprehensive unit tests ONLY for the changed code in this changeset, then run and fix any test failures.
 
 ## Requirements
-1. Analyze the git diff below to identify:
-   - New functions/methods that need testing
-   - Modified functions/methods that need updated tests
-   - Edge cases and error conditions
 
-2. Create unit tests that:
-   - Test all new functionality
-   - Cover happy path and edge cases
-   - Test error handling
-   - Follow the project's existing test patterns
-   - Have clear, descriptive test names
+### 1. Analyze the Git Diff
+Identify:
+- New functions/methods that need testing
+- Modified functions/methods that need updated tests
+- Edge cases and error conditions
+- Changed file locations and paths
 
-3. For each test file:
-   - Place tests in the appropriate test directory
-   - Use the same naming convention as existing tests
-   - Include necessary imports and setup
+### 2. Follow Project Test Folder Structure **STRICTLY**
+**CRITICAL**: You MUST follow the existing test folder structure:
+
+- **Examine the project** for existing test directories (e.g., \`test/\`, \`tests/\`, \`__tests__/\`, \`src/test/\`, etc.)
+- **Check for unit test subdirectory**: Look for \`test/unit/\`, \`tests/unit/\`, \`__tests__/unit/\` patterns
+- **Mirror the source structure**: If source is at \`src/services/cart.ts\`, test should be at \`test/unit/services/cart.test.ts\`
+- **Use correct naming convention**: Check existing test files for naming patterns:
+  - \`.test.ts\`, \`.spec.ts\`, \`_test.py\`, \`Test.java\`, etc.
+- **Respect directory hierarchy**: Match the exact folder structure of source files
+- **Check for test configuration**: Look for test config files (jest.config.js, pytest.ini, etc.) that define test paths
+
+**Example Structures**:
+- Java: \`src/main/java/com/example/Service.java\` → \`src/test/java/com/example/ServiceTest.java\`
+- Python: \`src/services/cart.py\` → \`tests/unit/services/test_cart.py\`
+- TypeScript/Node: \`src/services/cart.ts\` → \`test/unit/services/cart.test.ts\`
+- TypeScript Alt: \`src/services/cart.ts\` → \`__tests__/unit/services/cart.spec.ts\`
+- Node.js: \`lib/utils/helper.js\` → \`test/unit/utils/helper.test.js\`
+
+**Common Patterns**:
+- \`test/unit/\` for unit tests, \`test/integration/\` for integration tests
+- \`tests/unit/\` and \`tests/integration/\` separation
+- \`__tests__/unit/\` in some JavaScript/TypeScript projects
+
+### 3. Create Quality Unit Tests
+- Test all new functionality
+- Cover happy path and edge cases
+- Test error handling
+- Follow the project's existing test patterns
+- Have clear, descriptive test names
+- Include necessary imports and setup/teardown
 
 ## Changeset (Git Diff)
 
@@ -520,12 +569,20 @@ ${changeset}
 \`\`\`
 
 ## Action Items
-1. Review the changes above
-2. Generate unit test files for the modified code
-3. Run the tests and fix any failures
-4. Ensure all tests pass before marking complete
+1. **FIRST**: Examine the project structure to identify the test folder pattern (especially check for \`test/unit/\` or \`tests/unit/\`)
+2. Review the changes above
+3. Generate unit test files in the **CORRECT test directory structure** (including the \`unit\` subdirectory if it exists)
+4. **RUN the tests** using the project's test command (npm test, pytest, mvn test, etc.)
+5. **Fix any failing tests** - analyze failures and correct the test code
+6. **Re-run tests** until all tests pass
+7. Report the test results (number of tests, pass/fail status, file locations)
 
-Please generate the unit tests now.`;
+**IMPORTANT**: 
+- You must follow the exact test folder structure of the project (including \`unit/\` subdirectory)
+- You must run the tests and fix any failures
+- Do not just generate test code - execute and validate it!
+
+Please generate and run the unit tests now.`;
     }
 
     private async _startWorkOnIssue(directory: string, issueKey: string): Promise<void> {
@@ -552,7 +609,7 @@ Please generate the unit tests now.`;
                 const contextWithInstructions = result.context + 
                     `\n\n---\n**IMPORTANT INSTRUCTIONS:**\n` +
                     `1. Implement the required changes for this issue\n` +
-                    `2. Validate your implementation thoroughly\n` +
+                    `2. Validate your implementation if its running or not just by running the basic health check\n` +
                     `3. **DO NOT create unit tests yet** - unit tests will be created in a separate step after you validate the code\n` +
                     `4. Once you've validated the code changes, click the "Create Unit Tests" button to generate tests for your changeset\n` +
                     `5. The unit test generation will analyze only the files you've changed\n`;
@@ -563,6 +620,10 @@ Please generate the unit tests now.`;
                 
                 progress.report({ message: 'Opening workspace...' });
                 await this._executeWithContextAndFiles(directory, contextWithInstructions, result.attachmentFiles, issueKey, issueType);
+                
+                // Refresh the issue list to update button states
+                progress.report({ message: 'Refreshing issue list...' });
+                await this._fetchJiraIssues();
             });
         } catch (error) {
             vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : String(error)}`);
