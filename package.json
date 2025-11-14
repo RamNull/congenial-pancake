@@ -23,16 +23,45 @@
     "automation"
   ],
   "activationEvents": [
-    "onCommand:copilot-context-executor.executePrompt"
+    "*"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "copilot-context-executor",
+          "title": "Copilot Context",
+          "icon": "$(sparkle)"
+        }
+      ]
+    },
+    "views": {
+      "copilot-context-executor": [
+        {
+          "id": "copilotContextView",
+          "name": "Executor",
+          "type": "webview"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "copilot-context-executor.executePrompt",
-        "title": "Execute Copilot Prompt with Context"
+        "title": "Execute Copilot Prompt with Context",
+        "icon": "$(play)"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Copilot Context Executor",
+      "properties": {
+        "copilotContextExecutor.pendingPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "Internal: Stores pending prompt to execute after workspace reload"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

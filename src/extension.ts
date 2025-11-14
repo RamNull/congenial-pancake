@@ -9,11 +9,299 @@ interface CopilotContext {
 }
 
 /**
+ * View Provider for the Copilot Context sidebar
+ */
+class CopilotContextViewProvider implements vscode.WebviewViewProvider {
+    public static readonly viewType = 'copilotContextView';
+    private _view?: vscode.WebviewView;
+
+    constructor(private readonly _extensionUri: vscode.Uri) {}
+
+    public resolveWebviewView(
+        webviewView: vscode.WebviewView,
+        context: vscode.WebviewViewResolveContext,
+        _token: vscode.CancellationToken,
+    ) {
+        console.log('CopilotContextViewProvider: resolveWebviewView called');
+        this._view = webviewView;
+
+        webviewView.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [this._extensionUri]
+        };
+
+        webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
+        console.log('CopilotContextViewProvider: HTML set');
+
+        // Handle messages from the webview
+        webviewView.webview.onDidReceiveMessage(async (data) => {
+            console.log('CopilotContextViewProvider: received message', data.type);
+            switch (data.type) {
+                case 'browseDirectory': {
+                    const directory = await this._selectDirectory();
+                    if (directory && this._view) {
+                        this._view.webview.postMessage({ 
+                            type: 'setDirectory', 
+                            path: directory 
+                        });
+                    }
+                    break;
+                }
+                case 'executePrompt': {
+                    await this._executeWithContext(data.directory, data.payload);
+                    break;
+                }
+            }
+        });
+    }
+
+    private async _selectDirectory(): Promise<string | undefined> {
+        const options: vscode.OpenDialogOptions = {
+            canSelectFiles: false,
+            canSelectFolders: true,
+            canSelectMany: false,
+            openLabel: 'Select Code Directory',
+            title: 'Select the codebase directory to analyze'
+        };
+
+        const fileUri = await vscode.window.showOpenDialog(options);
+        return fileUri?.[0]?.fsPath;
+    }
+
+    private async _executeWithContext(directory: string, payload: string): Promise<void> {
+        try {
+            const folderUri = vscode.Uri.file(directory);
+            const currentWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            
+            // Check if the directory is already open
+            if (currentWorkspace === directory) {
+                // Directory is already open, execute prompt directly
+                try {
+                    await vscode.commands.executeCommand('workbench.panel.chat.view.copilot.focus');
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                    
+                    await vscode.commands.executeCommand('workbench.action.chat.open', {
+                        query: payload
+                    });
+                    vscode.window.showInformationMessage('Prompt sent to GitHub Copilot Chat!');
+                } catch {
+                    vscode.window.showInformationMessage(
+                        `Copy this prompt to Copilot Chat: ${payload}`,
+                        'Copy Prompt'
+                    ).then(selection => {
+                        if (selection === 'Copy Prompt') {
+                            vscode.env.clipboard.writeText(payload);
+                            vscode.window.showInformationMessage('Prompt copied to clipboard!');
+                        }
+                    });
+                }
+            } else {
+                // Different directory, need to open it
+                // Save the payload to execute after reload
+                await vscode.workspace.getConfiguration().update(
+                    'copilotContextExecutor.pendingPrompt', 
+                    payload, 
+                    vscode.ConfigurationTarget.Global
+                );
+                
+                // Open the folder in the current window
+                await vscode.commands.executeCommand('vscode.openFolder', folderUri, false);
+            }
+        } catch (error) {
+            vscode.window.showErrorMessage(
+                `Error: ${error instanceof Error ? error.message : String(error)}`
+            );
+        }
+    }
+
+    private _getHtmlForWebview(webview: vscode.Webview) {
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Copilot Context Executor</title>
+    <style>
+        body {
+            padding: 15px;
+            font-family: var(--vscode-font-family);
+            color: var(--vscode-foreground);
+        }
+        h3 {
+            margin-top: 0;
+            margin-bottom: 20px;
+        }
+        .input-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 0.9em;
+            font-weight: 600;
+        }
+        input[type="text"], textarea {
+            width: 100%;
+            padding: 8px;
+            background-color: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 2px;
+            box-sizing: border-box;
+        }
+        textarea {
+            min-height: 80px;
+            resize: vertical;
+            font-family: var(--vscode-font-family);
+        }
+        input[type="text"]:focus, textarea:focus {
+            outline: 1px solid var(--vscode-focusBorder);
+        }
+        button {
+            width: 100%;
+            padding: 10px;
+            margin-top: 10px;
+            background-color: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            cursor: pointer;
+            border-radius: 2px;
+            font-weight: 600;
+        }
+        button:hover {
+            background-color: var(--vscode-button-hoverBackground);
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .browse-btn {
+            padding: 6px 10px;
+            margin-top: 5px;
+            width: auto;
+            font-size: 0.85em;
+        }
+    </style>
+</head>
+<body>
+    <h3>Copilot Context Executor</h3>
+    
+    <div class="input-group">
+        <label for="codeDirectory">Code Directory</label>
+        <input type="text" id="codeDirectory" placeholder="Select code directory..." readonly />
+        <button class="browse-btn" onclick="browseDirectory()">📁 Browse</button>
+    </div>
+    
+    <div class="input-group">
+        <label for="payload">AI Prompt Payload</label>
+        <textarea id="payload" placeholder="Enter your prompt for GitHub Copilot..."></textarea>
+    </div>
+    
+    <button onclick="executePrompt()" id="sendBtn">
+        ▶ Send to Copilot
+    </button>
+    
+    <script>
+        const vscode = acquireVsCodeApi();
+        
+        function browseDirectory() {
+            vscode.postMessage({ type: 'browseDirectory' });
+        }
+        
+        function executePrompt() {
+            const directory = document.getElementById('codeDirectory').value;
+            const payload = document.getElementById('payload').value;
+            
+            if (!directory) {
+                alert('Please select a code directory');
+                return;
+            }
+            
+            if (!payload.trim()) {
+                alert('Please enter a prompt');
+                return;
+            }
+            
+            vscode.postMessage({ 
+                type: 'executePrompt',
+                directory: directory,
+                payload: payload
+            });
+        }
+        
+        // Listen for messages from the extension
+        window.addEventListener('message', event => {
+            const message = event.data;
+            if (message.type === 'setDirectory') {
+                document.getElementById('codeDirectory').value = message.path;
+            }
+        });
+    </script>
+</body>
+</html>`;
+    }
+}
+
+/**
  * Activates the extension
  */
 export function activate(context: vscode.ExtensionContext) {
     console.log('Copilot Context Executor extension is now active');
+    console.log('Extension URI:', context.extensionUri.toString());
 
+    // Check if there's a pending prompt to execute
+    const pendingPrompt = vscode.workspace.getConfiguration().get<string>('copilotContextExecutor.pendingPrompt');
+    if (pendingPrompt) {
+        // Clear the pending prompt
+        vscode.workspace.getConfiguration().update(
+            'copilotContextExecutor.pendingPrompt', 
+            undefined, 
+            vscode.ConfigurationTarget.Global
+        );
+        
+        // Execute the prompt after a short delay to ensure workspace is fully loaded
+        setTimeout(async () => {
+            try {
+                await vscode.commands.executeCommand('workbench.panel.chat.view.copilot.focus');
+                await new Promise(resolve => setTimeout(resolve, 500));
+                
+                await vscode.commands.executeCommand('workbench.action.chat.open', {
+                    query: pendingPrompt
+                });
+                vscode.window.showInformationMessage('Prompt sent to GitHub Copilot Chat!');
+            } catch {
+                vscode.window.showInformationMessage(
+                    `Workspace opened. Copy this prompt to Copilot Chat: ${pendingPrompt}`,
+                    'Copy Prompt'
+                ).then(selection => {
+                    if (selection === 'Copy Prompt') {
+                        vscode.env.clipboard.writeText(pendingPrompt);
+                        vscode.window.showInformationMessage('Prompt copied to clipboard!');
+                    }
+                });
+            }
+        }, 2000);
+    }
+
+    // Register the webview view provider
+    const provider = new CopilotContextViewProvider(context.extensionUri);
+    console.log('Registering webview view provider for: copilotContextView');
+    
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider(
+            'copilotContextView',
+            provider,
+            {
+                webviewOptions: {
+                    retainContextWhenHidden: true
+                }
+            }
+        )
+    );
+    
+    console.log('Webview view provider registered successfully');
+
+    // Register the command
     const disposable = vscode.commands.registerCommand(
         'copilot-context-executor.executePrompt',
         async () => {
@@ -22,6 +310,7 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(disposable);
+    console.log('Extension activation complete');
 }
 
 /**
