@@ -479,18 +479,25 @@ class CopilotContextViewProvider implements vscode.WebviewViewProvider {
                     return;
                 }
                 
-                // Create PR using GitHub REST API
+                // Create PR using GitHub CLI
                 progress.report({ message: 'Creating pull request...' });
                 try {
                     const prTitle = issueDetails.summary;
                     const prBody = issueDetails.description || 'No description provided';
                     
-                    await this._createGitHubPR(directory, currentBranch, prTitle, prBody);
+                    execSync(
+                        `gh pr create --title "${prTitle.replace(/"/g, '\\\\"')}" --body "${prBody.replace(/"/g, '\\\\"').replace(/\n/g, ' ')}" --base main`,
+                        { cwd: directory, stdio: 'pipe' }
+                    );
                     
                     vscode.window.showInformationMessage(`Pull request created for ${issueKey}!`);
                 } catch (prError) {
                     const errorMsg = prError instanceof Error ? prError.message : String(prError);
-                    vscode.window.showWarningMessage(`Could not create PR: ${errorMsg}`);
+                    if (errorMsg.includes('gh')) {
+                        vscode.window.showWarningMessage('GitHub CLI (gh) not found. Please install it to create PRs automatically.');
+                    } else {
+                        vscode.window.showWarningMessage(`Could not create PR: ${errorMsg}`);
+                    }
                 }
                 
                 // Transition Jira to Validation
@@ -781,32 +788,114 @@ Please generate and run the unit tests now.`;
                 title: `Starting work on ${issueKey}...`,
                 cancellable: false
             }, async (progress) => {
+                // First, check if we need to open a different workspace
+                const folderUri = vscode.Uri.file(directory);
+                const currentWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+                
+                if (currentWorkspace !== directory) {
+                    // Different directory - open it first, then do everything else after reload
+                    progress.report({ message: 'Opening workspace...' });
+                    
+                    // Save all the work to be done after workspace opens
+                    await vscode.workspace.getConfiguration().update(
+                        'copilotContextExecutor.pendingWorkIssueKey',
+                        issueKey,
+                        vscode.ConfigurationTarget.Global
+                    );
+                    
+                    await vscode.workspace.getConfiguration().update(
+                        'copilotContextExecutor.pendingWorkDirectory',
+                        directory,
+                        vscode.ConfigurationTarget.Global
+                    );
+                    
+                    // Open the workspace
+                    await vscode.commands.executeCommand('vscode.openFolder', folderUri);
+                    return; // Execution will continue in activate() after reload
+                }
+                
+                // Workspace is already open, proceed with the workflow
                 progress.report({ message: 'Transitioning status to In Progress...' });
                 await this._transitionIssueToInProgress(config, issueKey);
                 
                 progress.report({ message: 'Loading issue details...' });
                 const result = await this._fetchFullIssueDetailsWithAttachments(config, issueKey);
                 
-                // Add instruction about unit tests
+                // Add instruction about implementation only - no testing
                 const contextWithInstructions = result.context + 
                     `\n\n---\n**IMPORTANT INSTRUCTIONS:**\n` +
                     `1. Implement the required changes for this issue\n` +
-                    `2. **Start the application** using the project's standard command (check package.json scripts, pom.xml, build.gradle, requirements.txt, etc.)\n` +
+                    `2. **ONLY start the application** - your job is ONLY to start it, nothing else:\n` +
+                    `   - Find the start command from package.json, pom.xml, build.gradle, requirements.txt, etc.\n` +
                     `   - For Node.js: npm start, npm run dev, or yarn start\n` +
                     `   - For Python: python app.py, flask run, uvicorn main:app, or python manage.py runserver\n` +
                     `   - For Java: mvn spring-boot:run, gradle bootRun, or java -jar target/app.jar\n` +
-                    `   - For other frameworks: use the appropriate start command\n` +
-                    `3. **If you need to test endpoints (like /health), ALWAYS open a NEW SEPARATE terminal** - never run test commands in the same terminal where the app is running\n` +
-                    `4. **DO NOT create ANY test files** (no test-api.js, health-check.js, validation scripts, etc.)\n` +
-                    `5. **DO NOT create unit tests** - they will be generated later when you click "Mark Complete"\n` +
-                    `6. Once the app starts successfully, click "Mark Complete" to generate unit tests\n`;
+                    `   - Run the start command in a terminal\n` +
+                    `   - **If the application starts successfully (no errors), YOU ARE DONE** - stop here!\n` +
+                    `3. **DO NOT check health endpoints** - DO NOT run curl, wget, or any HTTP requests\n` +
+                    `4. **DO NOT validate the application** - DO NOT test endpoints or functionality\n` +
+                    `5. **DO NOT create ANY test files** (no test-api.js, health-check.js, validation scripts, etc.)\n` +
+                    `6. **DO NOT create unit tests** - they will be generated later\n` +
+                    `7. Success = application starts without errors. That's it. Nothing more needed.\n`;
                 
                 progress.report({ message: 'Setting up Git repository...' });
                 const issueType = await this._getIssueType(config, issueKey);
                 await this._setupGitBranch(directory, issueKey, issueType, progress);
                 
-                progress.report({ message: 'Opening workspace...' });
-                await this._executeWithContextAndFiles(directory, contextWithInstructions, result.attachmentFiles, issueKey, issueType);
+                progress.report({ message: 'Sending to Copilot...' });
+                await this._sendToCopilotWithAttachments(contextWithInstructions, result.attachmentFiles);
+                
+                // Refresh the issue list to update button states
+                progress.report({ message: 'Refreshing issue list...' });
+                await this._fetchJiraIssues();
+            });
+        } catch (error) {
+            vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    public async _continueStartWork(directory: string, issueKey: string): Promise<void> {
+        try {
+            const config = vscode.workspace.getConfiguration().get<JiraConfig>('copilotContextExecutor.jiraConfig');
+            if (!config) {
+                vscode.window.showWarningMessage('Jira not configured');
+                return;
+            }
+
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: `Continuing work on ${issueKey}...`,
+                cancellable: false
+            }, async (progress) => {
+                progress.report({ message: 'Transitioning status to In Progress...' });
+                await this._transitionIssueToInProgress(config, issueKey);
+                
+                progress.report({ message: 'Loading issue details...' });
+                const result = await this._fetchFullIssueDetailsWithAttachments(config, issueKey);
+                
+                // Add instruction about implementation only - no testing
+                const contextWithInstructions = result.context + 
+                    `\n\n---\n**IMPORTANT INSTRUCTIONS:**\n` +
+                    `1. Implement the required changes for this issue\n` +
+                    `2. **ONLY start the application** - your job is ONLY to start it, nothing else:\n` +
+                    `   - Find the start command from package.json, pom.xml, build.gradle, requirements.txt, etc.\n` +
+                    `   - For Node.js: npm start, npm run dev, or yarn start\n` +
+                    `   - For Python: python app.py, flask run, uvicorn main:app, or python manage.py runserver\n` +
+                    `   - For Java: mvn spring-boot:run, gradle bootRun, or java -jar target/app.jar\n` +
+                    `   - Run the start command in a terminal\n` +
+                    `   - **If the application starts successfully (no errors), YOU ARE DONE** - stop here!\n` +
+                    `3. **DO NOT check health endpoints** - DO NOT run curl, wget, or any HTTP requests\n` +
+                    `4. **DO NOT validate the application** - DO NOT test endpoints or functionality\n` +
+                    `5. **DO NOT create ANY test files** (no test-api.js, health-check.js, validation scripts, etc.)\n` +
+                    `6. **DO NOT create unit tests** - they will be generated later\n` +
+                    `7. Success = application starts without errors. That's it. Nothing more needed.\n`;
+                
+                progress.report({ message: 'Setting up Git repository...' });
+                const issueType = await this._getIssueType(config, issueKey);
+                await this._setupGitBranch(directory, issueKey, issueType, progress);
+                
+                progress.report({ message: 'Sending to Copilot...' });
+                await this._sendToCopilotWithAttachments(contextWithInstructions, result.attachmentFiles);
                 
                 // Refresh the issue list to update button states
                 progress.report({ message: 'Refreshing issue list...' });
@@ -2040,6 +2129,50 @@ export function activate(context: vscode.ExtensionContext) {
     console.log('Copilot Context Executor extension is now active');
     console.log('Extension URI:', context.extensionUri.toString());
 
+    // Register the webview view provider first
+    const provider = new CopilotContextViewProvider(context.extensionUri, context);
+    console.log('Registering webview view provider for: copilotContextView');
+    
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider(
+            'copilotContextView',
+            provider,
+            {
+                webviewOptions: {
+                    retainContextWhenHidden: true
+                }
+            }
+        )
+    );
+
+    // Check if there's pending work to do after workspace reload
+    const pendingWorkIssueKey = vscode.workspace.getConfiguration().get<string>('copilotContextExecutor.pendingWorkIssueKey');
+    const pendingWorkDirectory = vscode.workspace.getConfiguration().get<string>('copilotContextExecutor.pendingWorkDirectory');
+    
+    if (pendingWorkIssueKey && pendingWorkDirectory) {
+        // Clear the pending work config
+        vscode.workspace.getConfiguration().update(
+            'copilotContextExecutor.pendingWorkIssueKey',
+            undefined,
+            vscode.ConfigurationTarget.Global
+        );
+        
+        vscode.workspace.getConfiguration().update(
+            'copilotContextExecutor.pendingWorkDirectory',
+            undefined,
+            vscode.ConfigurationTarget.Global
+        );
+        
+        // Execute the work after workspace is loaded
+        setTimeout(async () => {
+            try {
+                await provider._continueStartWork(pendingWorkDirectory, pendingWorkIssueKey);
+            } catch (error) {
+                vscode.window.showErrorMessage(`Error continuing work: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }, 2000);
+    }
+
     // Check if there's a pending prompt to execute
     const pendingPrompt = vscode.workspace.getConfiguration().get<string>('copilotContextExecutor.pendingPrompt');
     const pendingAttachments = vscode.workspace.getConfiguration().get<string[]>('copilotContextExecutor.pendingAttachments');
@@ -2101,22 +2234,6 @@ export function activate(context: vscode.ExtensionContext) {
             }
         }, 2000);
     }
-
-    // Register the webview view provider
-    const provider = new CopilotContextViewProvider(context.extensionUri, context);
-    console.log('Registering webview view provider for: copilotContextView');
-    
-    context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider(
-            'copilotContextView',
-            provider,
-            {
-                webviewOptions: {
-                    retainContextWhenHidden: true
-                }
-            }
-        )
-    );
     
     console.log('Webview view provider registered successfully');
 

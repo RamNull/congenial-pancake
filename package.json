@@ -65,6 +65,16 @@
           "default": [],
           "description": "Internal: Stores pending attachment file paths to open after workspace reload"
         },
+        "copilotContextExecutor.pendingWorkIssueKey": {
+          "type": "string",
+          "default": "",
+          "description": "Internal: Stores pending issue key to continue work after workspace reload"
+        },
+        "copilotContextExecutor.pendingWorkDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Internal: Stores pending work directory to continue work after workspace reload"
+        },
         "copilotContextExecutor.jiraConfig": {
           "type": "object",
           "default": null,
